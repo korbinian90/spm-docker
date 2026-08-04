@@ -1,18 +1,49 @@
 name: Build & Deploy Docker Containers
 on:
   workflow_dispatch:
+    inputs:
+      spm_release:
+        description: 'SPM release, e.g. 26.01'
+        required: false
+        type: string
+      spm_revision:
+        description: 'SPM revision, e.g. rc1 (leave empty for a final release)'
+        required: false
+        type: string
+      matlab_version:
+        description: 'MATLAB release the standalone was compiled with, e.g. R2025b'
+        required: false
+        type: string
+      tests:
+        description: 'report = run tests but publish regardless; gate = do not publish if tests fail; skip = do not run tests'
+        required: false
+        default: report
+        type: choice
+        options: [report, gate, skip]
   repository_dispatch:
     types: [trigger-container-build]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-docker-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-test-deploy-docker:
     runs-on: ubuntu-latest
-    env: # default settings (overwritten by repository_dispatch)
+    timeout-minutes: 150
+    env: # defaults, overwritten by workflow_dispatch / repository_dispatch below
       registry: ghcr.io
-      MATLAB_VERSION: R2024b
+      MATLAB_VERSION: R2025b
       AGREE_TO_MATLAB_RUNTIME_LICENSE: "yes"
-      SPM_RELEASE: "24.10"
-      SPM_REVISION: alpha22
+      SPM_RELEASE: "26.01"
+      SPM_REVISION: rc1
+      TESTS_MODE: report
+    outputs:
+      spm_tag: ${{ steps.derive_env.outputs.spm_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -20,8 +51,17 @@ jobs:
 
     name: Build ${{ matrix.recipe }}
     steps:
+      - name: Set environment variables for workflow_dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          [ -n "${{ inputs.matlab_version }}" ] && echo "MATLAB_VERSION=${{ inputs.matlab_version }}" >> $GITHUB_ENV
+          [ -n "${{ inputs.spm_release }}"    ] && echo "SPM_RELEASE=${{ inputs.spm_release }}"       >> $GITHUB_ENV
+          [ -n "${{ inputs.spm_revision }}"   ] && echo "SPM_REVISION=${{ inputs.spm_revision }}"     >> $GITHUB_ENV
+          echo "TESTS_MODE=${{ inputs.tests }}" >> $GITHUB_ENV
+          exit 0
+
       - name: Set environment variables for repository_dispatch
-        if: ${{ github.event_name == 'repository_dispatch' }}
+        if: github.event_name == 'repository_dispatch'
         run: |
           echo "MATLAB_VERSION=${{ github.event.client_payload.matlab_version }}" >> $GITHUB_ENV
           echo "AGREE_TO_MATLAB_RUNTIME_LICENSE=${{ github.event.client_payload.agree_to_matlab_runtime_license }}" >> $GITHUB_ENV
@@ -32,52 +72,266 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Create derived environment variables
+        id: derive_env
         run: |
-          echo "SPM_TAG=${SPM_RELEASE}${SPM_REVISION:+.${SPM_REVISION}}" >> $GITHUB_ENV
+          SPM_TAG="${SPM_RELEASE}${SPM_REVISION:+.${SPM_REVISION}}"
+          echo "SPM_TAG=${SPM_TAG}" >> $GITHUB_ENV
           echo "SPM_VERSION=${SPM_RELEASE:0:2}" >> $GITHUB_ENV
+          echo "IMAGE=${{ env.registry }}/${GITHUB_REPOSITORY}:docker-${{ matrix.recipe }}-${SPM_TAG}" >> $GITHUB_ENV
+          echo "spm_tag=${SPM_TAG}" >> $GITHUB_OUTPUT
+
+      # ---------------------------------------------------------------------
+      # Test data. The spm-tests-data repository is private, so this is
+      # best-effort: without the secret the data-dependent tests report as
+      # Incomplete, which is not treated as a failure.
+      # ---------------------------------------------------------------------
+      - name: Check whether test data is reachable
+        id: data_access
+        env:
+          TESTS_DATA_REPO_TOKEN: ${{ secrets.TESTS_DATA_REPO_TOKEN }}
+        run: |
+          if [ "${TESTS_MODE}" = "skip" ]; then
+            echo "available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [ -n "$TESTS_DATA_REPO_TOKEN" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "available=false" >> $GITHUB_OUTPUT
+          # In spm/spm-docker the secret is supposed to exist. Its absence is a
+          # misconfiguration that would silently reduce the suite to whatever
+          # runs without data, so fail rather than publish a falsely green run.
+          if [ "${{ github.repository_owner }}" = "spm" ]; then
+            echo "::error::TESTS_DATA_REPO_TOKEN is not set. The unit suite cannot access spm-tests-data, so coverage would be silently reduced. Set the secret, or run with tests=skip if that is genuinely intended."
+            exit 1
+          fi
+          echo "::warning::TESTS_DATA_REPO_TOKEN is not set (expected on a fork). Data-dependent tests will report as Incomplete and this run does NOT demonstrate a green suite."
+          {
+            echo "> [!WARNING]"
+            echo "> \`spm-tests-data\` was not available. Data-dependent tests reported as"
+            echo "> *Incomplete* and were **not** executed. This run does not demonstrate a"
+            echo "> green suite."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Get latest commit for tests data
+        id: checkout-tests-data
+        if: steps.data_access.outputs.available == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: spm/spm-tests-data
+          token: ${{ secrets.TESTS_DATA_REPO_TOKEN }}
+          path: tests/data
+          fetch-depth: 1
+          lfs: false
+
+      - name: Remove shallow-checked-out repo
+        if: steps.data_access.outputs.available == 'true'
+        run: rm -rf tests/data
+
+      - name: Try to retrieve test data from cache
+        id: cache-restore
+        if: steps.data_access.outputs.available == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: tests/data
+          key: tests-data2-${{ steps.checkout-tests-data.outputs.commit }}
+          restore-keys: tests-data2
+          enableCrossOsArchive: true
+
+      - name: If cache missed, pull latest commit with LFS
+        if: steps.data_access.outputs.available == 'true' && steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: spm/spm-tests-data
+          token: ${{ secrets.TESTS_DATA_REPO_TOKEN }}
+          path: tests/data
+          lfs: true
+
+      # Saved before the tests run: the suite writes outputs into tests/data,
+      # so caching afterwards would poison the cache for every later run.
+      - name: Cache test data
+        if: steps.data_access.outputs.available == 'true' && steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: tests/data
+          key: tests-data2-${{ steps.checkout-tests-data.outputs.commit }}
+
+      # ---------------------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------------------
+      # A failed LFS smudge leaves ~130 byte pointer files behind instead of the
+      # real data. The tests then fail in confusing ways, so catch it here.
+      - name: Verify test data
+        if: steps.data_access.outputs.available == 'true'
+        run: |
+          SIZE_KB=$(du -sk tests/data 2>/dev/null | cut -f1)
+          echo "tests/data is ${SIZE_KB} KB"
+          if [ "${SIZE_KB:-0}" -lt 51200 ]; then
+            echo "::error::tests/data is only ${SIZE_KB} KB, which means the Git LFS checkout did not resolve. Refusing to run a suite that would silently skip most data-dependent tests."
+            exit 1
+          fi
+
+      # The MATLAB Runtime install is ~10 GB and the runner ships with a lot of
+      # preinstalled toolchains we do not need. Reclaim the space up front
+      # rather than failing halfway through the image build.
+      - name: Free disk space
+        if: matrix.recipe == 'matlab'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
 
       - name: Build Container
+        timeout-minutes: 60
         run: |
-          tag=docker-${{ matrix.recipe }}-${{ env.SPM_TAG }}
-          latest_tag=docker-${{ matrix.recipe }}-latest
           docker build \
-          --build-arg MATLAB_VERSION=${{ env.MATLAB_VERSION }} \
-          --build-arg AGREE_TO_MATLAB_RUNTIME_LICENSE=${{ env.AGREE_TO_MATLAB_RUNTIME_LICENSE }} \
-          --build-arg SPM_VERSION=${{ env.SPM_VERSION }} \
-          --build-arg SPM_RELEASE=${{ env.SPM_RELEASE }} \
-          --build-arg SPM_REVISION=${{ env.SPM_REVISION }} \
-          -f ${{ matrix.recipe }}/Dockerfile \
-          -t ${{ env.registry }}/${GITHUB_REPOSITORY}:${tag} \
-          -t ${{ env.registry }}/${GITHUB_REPOSITORY}:${latest_tag} .
+            --build-arg MATLAB_VERSION=${{ env.MATLAB_VERSION }} \
+            --build-arg AGREE_TO_MATLAB_RUNTIME_LICENSE=${{ env.AGREE_TO_MATLAB_RUNTIME_LICENSE }} \
+            --build-arg SPM_VERSION=${{ env.SPM_VERSION }} \
+            --build-arg SPM_RELEASE=${{ env.SPM_RELEASE }} \
+            --build-arg SPM_REVISION=${{ env.SPM_REVISION }} \
+            -f ${{ matrix.recipe }}/Dockerfile \
+            -t ${{ env.IMAGE }} \
+            -t ${{ env.registry }}/${GITHUB_REPOSITORY}:docker-${{ matrix.recipe }}-latest .
 
+      # ---------------------------------------------------------------------
+      # Smoke test: does the image start SPM at all? Cheap, and it catches a
+      # broken Runtime install or a mismatched MATLAB_VERSION immediately.
+      # ---------------------------------------------------------------------
+      - name: Smoke test
+        if: env.TESTS_MODE != 'skip'
+        timeout-minutes: 10
+        run: |
+          docker run --rm --name spm_smoke_${{ matrix.recipe }} ${{ env.IMAGE }} \
+            eval "fprintf('SMOKE_OK %s\n', spm('Ver'));" | tee smoke.log
+          grep -q '^SMOKE_OK' smoke.log
+
+      # ---------------------------------------------------------------------
+      # Unit tests. Only the matlab image can run them: spm_tests uses
+      # matlab.unittest, which Octave does not provide. See the README.
+      #
+      # Phase 1 is the fast path, the whole suite in one Runtime session.
+      # Phase 2 only runs if phase 1 failed, and re-runs each test file in its
+      # own container so a failure or a graphics hang can be attributed to a
+      # specific test rather than taking the whole run down anonymously.
+      # ---------------------------------------------------------------------
+      - name: Unit tests (whole suite, single session)
+        id: tests_fast
+        if: matrix.recipe == 'matlab' && env.TESTS_MODE != 'skip'
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          MOUNT=""
+          if [ -d "${{ github.workspace }}/tests/data" ]; then
+            MOUNT="-v ${{ github.workspace }}/tests/data:/opt/spm/spm${SPM_VERSION}_mcr/spm${SPM_VERSION}/tests/data"
+          fi
+          # --name plus an explicit stop: if the step times out the docker CLI is
+          # killed but the container would otherwise keep running on the runner.
+          trap 'docker stop spm_tests_all >/dev/null 2>&1 || true' EXIT
+          set -o pipefail
+          docker run --rm --name spm_tests_all $MOUNT ${{ env.IMAGE }} test \
+            | tee suite.log
+
+      # "All tests PASSED" with a pile of Incomplete tests is not a green suite,
+      # it is a suite that mostly did not run. Say so.
+      - name: Warn on skipped tests
+        if: always() && matrix.recipe == 'matlab' && env.TESTS_MODE != 'skip'
+        run: |
+          [ -f suite.log ] || exit 0
+          INC=$(grep -oE '^Incomplete: [0-9]+' suite.log | tail -1 | grep -oE '[0-9]+' || echo 0)
+          TOT=$(grep -oE '^Total tests: [0-9]+' suite.log | tail -1 | grep -oE '[0-9]+' || echo 0)
+          echo "Incomplete: ${INC:-0} of ${TOT:-0}"
+          if [ "${INC:-0}" -gt 0 ]; then
+            echo "::warning::${INC} of ${TOT} tests were Incomplete (not executed). Usually missing test data or an unmet assumption."
+            {
+              echo ""
+              echo "> [!WARNING]"
+              echo "> \`${INC}\` of \`${TOT}\` tests were **Incomplete**, meaning they did not"
+              echo "> actually run. Check the log before treating this as a green suite."
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Unit tests (isolated per test file, on failure)
+        id: tests_isolated
+        if: matrix.recipe == 'matlab' && env.TESTS_MODE != 'skip' && steps.tests_fast.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          SUMMARY_FILE: test_summary.md
+        run: |
+          if [ -d "${{ github.workspace }}/tests/data" ]; then
+            export SPM_TESTS_DATA="${{ github.workspace }}/tests/data"
+          fi
+          bash matlab/run_tests.sh "${{ env.IMAGE }}" "" 300
+
+      - name: Publish test summary
+        if: always() && matrix.recipe == 'matlab'
+        run: |
+          if [ -f test_summary.md ]; then
+            cat test_summary.md >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.tests_fast.outcome }}" = "success" ]; then
+            echo "### SPM container unit tests" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Whole suite passed in a single Runtime session." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload test logs
+        if: always() && matrix.recipe == 'matlab'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.recipe }}-${{ env.SPM_TAG }}
+          path: |
+            spm_test_results_*.log
+            test_summary.md
+            suite.log
+            smoke.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Deliberately a separate step: the test steps above use
+      # continue-on-error so that the isolated re-run and the artifact upload
+      # always happen. This is where a red suite actually stops the release.
+      # Gates on the single-session run. `docker run <image> test` is the
+      # documented user-facing command, so if that fails the image is broken for
+      # users regardless of whether each test passes on its own. Phase 1 red plus
+      # phase 2 green is still a failure: it means the tests interfere with each
+      # other in a shared session.
+      - name: Gate on test results
+        if: env.TESTS_MODE == 'gate'
+        run: |
+          if [ "${{ steps.tests_fast.outcome }}" = "failure" ]; then
+            echo "::error::Unit tests failed and TESTS_MODE=gate; not publishing."
+            if [ "${{ steps.tests_isolated.outcome }}" = "success" ]; then
+              echo "::warning::Every test passes in isolation, so the failure is an interaction between tests in a shared session."
+            fi
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # Deploy
+      # ---------------------------------------------------------------------
       - name: Log in to GitHub Container Registry
-        if: ${{ github.repository_owner }} == 'spm'
+        if: github.repository_owner == 'spm'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.registry }}
-          username: ${{ secrets.GHCR_USERNAME }}
+          username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy Container
-        if: ${{ github.repository_owner }} == 'spm'
+        if: github.repository_owner == 'spm'
         run: docker push ${{ env.registry }}/${GITHUB_REPOSITORY} --all-tags
 
   trigger-singularity-build:
     runs-on: ubuntu-latest
     needs: build-test-deploy-docker
+    if: github.repository_owner == 'spm'
     steps:
-      - name: Set environment variables for repository_dispatch
-        if: ${{ github.event_name == 'repository_dispatch' }}
-        run: |
-          SPM_RELEASE=${{ github.event.client_payload.spm_release }}
-          SPM_REVISION=${{ github.event.client_payload.spm_revision }}
-          echo "SPM_TAG=${SPM_RELEASE}${SPM_REVISION:+.${SPM_REVISION}}" >> $GITHUB_ENV
-
-      - name: Trigger workflow in spm-docker
+      - name: Trigger singularity build
         uses: peter-evans/repository-dispatch@v3
         with:
           event-type: trigger-singularity-build
           client-payload: |-
             {
-              "spm_tag": "${{ env.SPM_TAG }}"
+              "spm_tag": "${{ needs.build-test-deploy-docker.outputs.spm_tag }}"
             }
