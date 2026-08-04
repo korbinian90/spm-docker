@@ -1,16 +1,26 @@
 name: Build & Deploy Singularity Containers
 on:
   workflow_dispatch:
+    inputs:
+      spm_tag:
+        description: 'SPM tag of the Docker image to convert, e.g. 26.01.rc1'
+        required: false
+        type: string
   repository_dispatch:
     types: [trigger-singularity-build]
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   build-test-deploy-singularity:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     container:
       image: quay.io/singularity/singularity:v3.8.3 # v4 cannot acces oras://ghcr.io
     env:
-      SPM_TAG: "24.10.alpha21"
+      SPM_TAG: "26.01.rc1"
     strategy:
       fail-fast: false
       matrix:
@@ -19,22 +29,66 @@ jobs:
     name: Build ${{ matrix.recipe }}
     steps:
       - name: Set environment variables for repository_dispatch
-        if: ${{ github.event_name == 'repository_dispatch' }}
+        if: github.event_name == 'repository_dispatch'
         run: echo "SPM_TAG=${{ github.event.client_payload.spm_tag }}" >> $GITHUB_ENV
+
+      - name: Set environment variables for workflow_dispatch
+        if: github.event_name == 'workflow_dispatch' && inputs.spm_tag != ''
+        run: echo "SPM_TAG=${{ inputs.spm_tag }}" >> $GITHUB_ENV
 
       # Pull the Docker image with Singularity and convert it to a SIF file
       - name: Build Singularity image from Docker
+        timeout-minutes: 45
         run: |
           singularity pull docker://ghcr.io/spm/spm-docker:docker-${{matrix.recipe}}-${{env.SPM_TAG}}
           mv spm-docker_docker-${{matrix.recipe}}-${{env.SPM_TAG}}.sif spm.sif
 
+      # This test was removed in 7f442c1 because it failed with a read-only
+      # filesystem error. A SIF is mounted read only, but the MATLAB Runtime
+      # still needs a writable HOME for its preferences (~/.matlab) and its CTF
+      # cache (~/.mcrCacheNN). Bind a host directory over /root and point
+      # MCR_CACHE_ROOT at it.
+      #
+      # --home rather than --bind: a plain bind needs the target to already
+      # exist inside the read-only image, whereas /root always does.
+      - name: Test Container
+        timeout-minutes: 20
+        run: |
+          mkdir -p /tmp/spmhome
+          export SINGULARITYENV_MCR_CACHE_ROOT=/tmp/spmhome/mcr_cache
+          export SINGULARITYENV_MCR_INHIBIT_CTF_LOCK=1
+          singularity run --home /tmp/spmhome:/root spm.sif --version | tee sif.log
+          grep -qi 'spm' sif.log
+
+      # Beyond --version: actually start SPM and evaluate an expression, which
+      # is what catches a Runtime that unpacked but cannot run.
+      - name: Smoke test SPM startup
+        timeout-minutes: 20
+        run: |
+          export SINGULARITYENV_MCR_CACHE_ROOT=/tmp/spmhome/mcr_cache
+          export SINGULARITYENV_MCR_INHIBIT_CTF_LOCK=1
+          singularity run --home /tmp/spmhome:/root spm.sif \
+            eval "fprintf('SMOKE_OK %s\n', spm('Ver'));" | tee sif_smoke.log
+          grep -q '^SMOKE_OK' sif_smoke.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: singularity-logs-${{ matrix.recipe }}-${{ env.SPM_TAG }}
+          path: |
+            sif.log
+            sif_smoke.log
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Login and Deploy Container
-        if: ${{ github.repository_owner }} == 'spm'
+        if: github.repository_owner == 'spm'
         run: |
           tag=singularity-${{ matrix.recipe }}-${{ env.SPM_TAG }}
           latest_tag=singularity-${{ matrix.recipe }}-latest
           echo "Tag is $tag."
           singularity remote add oras ghcr.io
-          echo ${{ secrets.GITHUB_TOKEN }} | singularity remote login -u ${{ secrets.GHCR_USERNAME }} --password-stdin oras://ghcr.io
+          echo ${{ secrets.GITHUB_TOKEN }} | singularity remote login -u ${{ secrets.GHCR_USERNAME || github.actor }} --password-stdin oras://ghcr.io
           singularity push spm.sif oras://ghcr.io/${GITHUB_REPOSITORY}:${tag}
           singularity push spm.sif oras://ghcr.io/${GITHUB_REPOSITORY}:${latest_tag}
