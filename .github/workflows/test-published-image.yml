@@ -1,0 +1,201 @@
+
+# Tests the image that is actually published, as opposed to one built moments
+# earlier in the same run. Nothing here rebuilds anything.
+#
+# What this is for: the images are built on `ubuntu:latest` and the MATLAB
+# Runtime pulls in system libraries, so a published image can start failing
+# without a single commit to this repository or to SPM. That drift is invisible
+# to a release-triggered pipeline, which only ever tests freshly built images.
+#
+# It does NOT cover unreleased SPM code. The unit tests are encrypted into the
+# CTF archive, so testing a change to SPM means recompiling the standalone.
+# That lives in spm/spm, see .github/workflows/test_container.yml there.
+
+name: Test Published Image
+
+on:
+  schedule:
+    # 04:00 UTC on the 1st of every month
+    - cron: '0 4 1 * *'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to test, e.g. docker-matlab-latest'
+        required: false
+        default: docker-matlab-latest
+        type: string
+      timeout_per_test:
+        description: 'Seconds before a hanging test container is killed'
+        required: false
+        default: '300'
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  test-published-image:
+    name: Test ${{ inputs.image_tag || 'docker-matlab-latest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      IMAGE: ghcr.io/spm/spm-docker:${{ inputs.image_tag || 'docker-matlab-latest' }}
+      TIMEOUT_PER_TEST: ${{ inputs.timeout_per_test || '300' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check whether test data is reachable
+        id: data_access
+        env:
+          TESTS_DATA_REPO_TOKEN: ${{ secrets.TESTS_DATA_REPO_TOKEN }}
+        run: |
+          if [ -n "$TESTS_DATA_REPO_TOKEN" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "available=false" >> $GITHUB_OUTPUT
+          if [ "${{ github.repository_owner }}" = "spm" ]; then
+            echo "::error::TESTS_DATA_REPO_TOKEN is not set, so the suite would run with reduced coverage."
+            exit 1
+          fi
+          echo "::warning::TESTS_DATA_REPO_TOKEN is not set (expected on a fork); data-dependent tests will be Incomplete."
+
+      - name: Checkout test data
+        if: steps.data_access.outputs.available == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: spm/spm-tests-data
+          token: ${{ secrets.TESTS_DATA_REPO_TOKEN }}
+          path: tests/data
+          lfs: true
+
+      - name: Verify test data
+        if: steps.data_access.outputs.available == 'true'
+        run: |
+          SIZE_KB=$(du -sk tests/data 2>/dev/null | cut -f1)
+          echo "tests/data is ${SIZE_KB} KB"
+          if [ "${SIZE_KB:-0}" -lt 51200 ]; then
+            echo "::error::tests/data is only ${SIZE_KB} KB; the Git LFS checkout did not resolve."
+            exit 1
+          fi
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        timeout-minutes: 30
+        run: |
+          docker pull ${{ env.IMAGE }}
+          docker image inspect ${{ env.IMAGE }} \
+            --format 'Created: {{.Created}}{{"\n"}}Digest: {{index .RepoDigests 0}}'
+
+      - name: Smoke test
+        timeout-minutes: 10
+        run: |
+          docker run --rm --name spm_smoke ${{ env.IMAGE }} \
+            eval "fprintf('SMOKE_OK %s\n', spm('Ver'));" | tee smoke.log
+          grep -q '^SMOKE_OK' smoke.log
+
+      # `docker run <image> test` is the documented user-facing command, so it is
+      # both the cheapest check and the most representative one. The image is
+      # expected to pass, so in the normal month this is the only phase that runs
+      # and it costs one Runtime session instead of ~90 cold starts.
+      - name: Unit tests (whole suite, single session)
+        id: tests_fast
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          MOUNT=""
+          if [ -d "${{ github.workspace }}/tests/data" ]; then
+            TESTS_DIR=$(docker run --rm --entrypoint sh ${{ env.IMAGE }} \
+              -c 'ls -d /opt/spm/spm*_mcr/spm*/tests' | tr -d '\r')
+            if [ -z "$TESTS_DIR" ]; then
+              echo "::error::Could not locate the tests directory inside the image; the CTF archive may not have been extracted at build time."
+              exit 1
+            fi
+            MOUNT="-v ${{ github.workspace }}/tests/data:${TESTS_DIR}/data"
+          fi
+          trap 'docker stop spm_tests_all >/dev/null 2>&1 || true' EXIT
+          set -o pipefail
+          docker run --rm --name spm_tests_all $MOUNT ${{ env.IMAGE }} test | tee suite.log
+
+      - name: Warn on skipped tests
+        if: always()
+        run: |
+          [ -f suite.log ] || exit 0
+          INC=$(grep -oE '^Incomplete: [0-9]+' suite.log | tail -1 | grep -oE '[0-9]+' || echo 0)
+          TOT=$(grep -oE '^Total tests: [0-9]+' suite.log | tail -1 | grep -oE '[0-9]+' || echo 0)
+          if [ "${INC:-0}" -gt 0 ]; then
+            echo "::warning::${INC} of ${TOT} tests were Incomplete (not executed)."
+          fi
+
+      # Diagnosis only, and only when something is already wrong. This is where
+      # the ~90 cold starts are worth paying for: they turn "the suite died"
+      # into "this test hung".
+      - name: Unit tests (isolated per test file, on failure)
+        id: tests_isolated
+        if: steps.tests_fast.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 75
+        env:
+          SUMMARY_FILE: test_summary.md
+        run: |
+          if [ -d "${{ github.workspace }}/tests/data" ]; then
+            export SPM_TESTS_DATA="${{ github.workspace }}/tests/data"
+          fi
+          bash matlab/run_tests.sh "${{ env.IMAGE }}" "" "${{ env.TIMEOUT_PER_TEST }}"
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Published image test"
+            echo ""
+            echo "Image: \`${{ env.IMAGE }}\`"
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+          if [ -f test_summary.md ]; then
+            cat test_summary.md >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.tests_fast.outcome }}" = "success" ]; then
+            echo "Whole suite passed in a single Runtime session." >> $GITHUB_STEP_SUMMARY
+          fi
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-image-test-logs
+          path: |
+            spm_test_results_*.log
+            test_summary.md
+            suite.log
+            smoke.log
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # Gates on the single-session run, not on the isolated one. `docker run
+      # <image> test` is what users actually run, so if that fails the image is
+      # broken for them regardless of whether each test passes in isolation.
+      # Phase 1 red plus phase 2 green is still a real failure: it means the
+      # tests interfere with each other in a shared session.
+      - name: Fail if tests did not pass
+        if: steps.tests_fast.outcome == 'failure'
+        run: |
+          echo "::error::The published image no longer passes the SPM unit suite. Nothing in SPM changed, so this is environment drift."
+          if [ "${{ steps.tests_isolated.outcome }}" = "success" ]; then
+            echo "::warning::Every test passes in isolation, so the failure is an interaction between tests in a shared session."
+          fi
+          exit 1
