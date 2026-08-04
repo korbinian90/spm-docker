@@ -1,0 +1,77 @@
+# Same container environment as matlab/Dockerfile, but wrapping a standalone
+# built locally instead of one downloaded from a GitHub release.
+#
+# This exists so that SPM code which has not been released yet can be tested in
+# the container. The unit tests are compiled and encrypted into the CTF archive,
+# so editing tests/*.m has no effect inside a container built from a release:
+# the standalone has to be recompiled for a test change to take effect.
+#
+# Keep this in step with matlab/Dockerfile. Only the acquisition of the
+# standalone differs; the runtime setup and entry point must stay identical,
+# otherwise a failure here would not tell you anything about the real image.
+#
+# Build context must contain spm_standalone_Linux.zip, packing the same layout
+# as a release asset:
+#     spm_standalone/spm<NN>
+#     runtime_installer/Runtime_*.install
+#
+#   docker build -t spm-local -f matlab/Dockerfile.local .
+
+FROM ubuntu:latest
+
+ARG AGREE_TO_MATLAB_RUNTIME_LICENSE=yes
+ARG STANDALONE_ZIP=spm_standalone_Linux.zip
+
+LABEL org.opencontainers.image.authors="SPM <fil.spm@ucl.ac.uk>"
+LABEL org.opencontainers.image.source="https://github.com/spm/spm-docker"
+LABEL org.opencontainers.image.title="SPM Standalone (locally built, for testing)"
+LABEL org.opencontainers.image.description="Not for distribution: wraps an unreleased SPM standalone for container testing"
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y install \
+    unzip xorg wget \
+    && apt-get clean \
+    && rm -rf \
+    /tmp/hsperfdata* \
+    /var/*/apt/*/partial \
+    /var/lib/apt/lists/* \
+    /var/log/apt/term*
+
+ENV MCR_INHIBIT_CTF_LOCK=1
+ENV SPM_HTML_BROWSER=0
+
+COPY ${STANDALONE_ZIP} /opt/spm_standalone_Linux.zip
+
+# The installer filename carries the MATLAB release and, for release builds, the
+# SPM tag, so glob for it rather than reconstructing the name. Likewise the
+# executable is named after spm('Ver') (spm26, spmdev, ...), so detect it.
+RUN unzip -q /opt/spm_standalone_Linux.zip -d /opt \
+    && rm -f /opt/spm_standalone_Linux.zip \
+    && mv /opt/spm_standalone /opt/spm \
+    && INSTALLER="$(find /opt/runtime_installer -name 'Runtime*.install' | head -n 1)" \
+    && if [ -z "$INSTALLER" ]; then echo "No MATLAB Runtime installer in the zip" >&2; exit 1; fi \
+    && chmod +x "$INSTALLER" \
+    && "$INSTALLER" -agreeToLicense ${AGREE_TO_MATLAB_RUNTIME_LICENSE} \
+        -destinationFolder /usr/local/MATLAB/MATLAB_Runtime \
+    && rm -rf /opt/runtime_installer
+
+# Resolve the installed Runtime version and bake LD_LIBRARY_PATH in, rather than
+# hardcoding a MATLAB release that must be kept in sync with the build.
+RUN MATLAB_VERSION="$(ls /usr/local/MATLAB/MATLAB_Runtime | grep '^R' | head -n 1)" \
+    && R=/usr/local/MATLAB/MATLAB_Runtime/${MATLAB_VERSION} \
+    && printf '%s\n' \
+        "LD_LIBRARY_PATH=${R}/runtime/glnxa64:${R}/bin/glnxa64:${R}/sys/os/glnxa64:${R}/sys/opengl/lib/glnxa64:${R}/extern/bin/glnxa64" \
+        > /etc/spm_runtime_env
+
+# Extract the CTF archive at build time. Required for read-only runtimes such as
+# Singularity, and it verifies the install in the same move.
+RUN set -a && . /etc/spm_runtime_env && set +a \
+    && SPM_EXEC="$(find /opt/spm -maxdepth 1 -type f -name 'spm*' ! -name '*.*' | head -n 1)" \
+    && if [ -z "$SPM_EXEC" ]; then echo "No SPM executable found in /opt/spm" >&2; exit 1; fi \
+    && chmod +x "$SPM_EXEC" \
+    && "$SPM_EXEC" function exit \
+    && printf '#!/bin/sh\nset -a\n. /etc/spm_runtime_env\nset +a\nexec %s "$@"\n' "$SPM_EXEC" \
+        > /usr/local/bin/spm \
+    && chmod +x /usr/local/bin/spm
+
+ENTRYPOINT ["spm"]
+CMD ["--help"]
