@@ -1,0 +1,9 @@
+# None of the Dockerfiles COPY anything from the build context: they fetch the
+# SPM release over the network instead. Without this file `docker build .`
+# uploads the whole working tree to the daemon, which in CI includes the
+# multi-gigabyte spm-tests-data checkout.
+*
+
+# Exception: a Dockerfile variant that wraps a locally built standalone (rather
+# than a published release) needs the zip to reach the daemon.
+!spm_standalone_*.zip
