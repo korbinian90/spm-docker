@@ -32,6 +32,34 @@ If the container\'s root filesystem is mounted as read only
 -v /tmp/.matlab:/root/.matlab
 ```
 
+## Testing
+
+The containers run SPM Standalone headless, with no X server. The whole unit
+test suite can be run in one shot:
+
+```bash
+docker run --rm ghcr.io/spm/spm-docker:docker-matlab-latest test
+```
+
+Some tests need the data from the private `spm/spm-tests-data` repository.
+Without it they report as *Incomplete*, which is not a failure. To supply it,
+bind mount a checkout over the `tests/data` directory inside the container
+(`NN` is the SPM major version, e.g. `26`):
+
+```bash
+docker run --rm \
+  -v /path/to/spm-tests-data:/opt/spm/spmNN_mcr/spmNN/tests/data \
+  ghcr.io/spm/spm-docker:docker-matlab-latest test
+```
+
+### Why the octave image only gets a smoke test
+
+`spm_tests` is built on `matlab.unittest`, which GNU Octave does not provide,
+and it has no Octave code path. Separately, the `bin/spm-octave` launcher ends
+with a `waitfor` loop over open figures, so a test that leaves a figure behind
+would hang the container indefinitely. Running the suite under Octave needs both
+of those addressed in the SPM repository first.
+
 ## Technology
 
 ### Docker
@@ -52,7 +80,7 @@ The official SPM `Dockerfiles`:
 
 * [Dockerfile](https://github.com/spm/spm-docker/blob/main/matlab/Dockerfile) using the [SPM Standalone](https://www.fil.ion.ucl.ac.uk/spm/docs/installation/standalone/)
 * [Dockerfile](https://github.com/spm/spm-docker/blob/main/octave/Dockerfile) using [GNU Octave](https://www.octave.org/)
-* [Dockerfile](https://github.com/spm/spm-docker/blob/main/matlab/Dockerfile) using the [SPM Standalone](https://www.fil.ion.ucl.ac.uk/spm/docs/installation/standalone/) and selected [third-party toolboxes](https://github.com/spm-toolboxes/) (outdated)
+* [Dockerfile.local](https://github.com/spm/spm-docker/blob/main/matlab/Dockerfile.local) wrapping a locally built standalone, used to test unreleased SPM
 
 The singularity `sif` images are created from the docker images.
 
