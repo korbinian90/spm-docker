@@ -1,4 +1,4 @@
-FROM ubuntu:latest
+FROM ubuntu:24.04
 
 ARG MATLAB_VERSION=R2025b
 ARG AGREE_TO_MATLAB_RUNTIME_LICENSE=yes
@@ -41,7 +41,8 @@ RUN wget --no-check-certificate --progress=bar:force -P /opt https://github.com/
     && unzip -q /opt/spm_standalone_${SPM_TAG}_Linux.zip -d /opt \
     && rm -f /opt/spm_standalone_${SPM_TAG}_Linux.zip \
     && mv /opt/spm_standalone /opt/spm \
-    && /opt/runtime_installer/Runtime_${MATLAB_VERSION}_for_spm_standalone_${SPM_TAG}.install -agreeToLicense ${AGREE_TO_MATLAB_RUNTIME_LICENSE} \
+    && { /opt/runtime_installer/Runtime_${MATLAB_VERSION}_for_spm_standalone_${SPM_TAG}.install -agreeToLicense ${AGREE_TO_MATLAB_RUNTIME_LICENSE} \
+         || { echo "=== MATLAB Runtime installer log ==="; cat /tmp/mathworks_*.log 2>/dev/null; exit 1; }; } \
     && /opt/spm/spm${SPM_VERSION} function exit \
     && chmod +x /opt/spm/spm${SPM_VERSION} \
     && ln -s /opt/spm/spm${SPM_VERSION} /usr/local/bin/spm

@@ -17,7 +17,7 @@
 #
 #   docker build -t spm-local -f matlab/Dockerfile.local .
 
-FROM ubuntu:latest
+FROM ubuntu:24.04
 
 ARG AGREE_TO_MATLAB_RUNTIME_LICENSE=yes
 ARG STANDALONE_ZIP=spm_standalone_Linux.zip
@@ -50,8 +50,9 @@ RUN unzip -q /opt/spm_standalone_Linux.zip -d /opt \
     && INSTALLER="$(find /opt/runtime_installer -name 'Runtime*.install' | head -n 1)" \
     && if [ -z "$INSTALLER" ]; then echo "No MATLAB Runtime installer in the zip" >&2; exit 1; fi \
     && chmod +x "$INSTALLER" \
-    && "$INSTALLER" -agreeToLicense ${AGREE_TO_MATLAB_RUNTIME_LICENSE} \
-        -destinationFolder /usr/local/MATLAB/MATLAB_Runtime \
+    && { "$INSTALLER" -agreeToLicense ${AGREE_TO_MATLAB_RUNTIME_LICENSE} \
+            -destinationFolder /usr/local/MATLAB/MATLAB_Runtime \
+         || { echo "=== MATLAB Runtime installer log ==="; cat /tmp/mathworks_*.log 2>/dev/null; exit 1; }; } \
     && rm -rf /opt/runtime_installer
 
 # Resolve the installed Runtime version and bake LD_LIBRARY_PATH in, rather than
